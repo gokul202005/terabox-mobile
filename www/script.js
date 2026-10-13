@@ -868,8 +868,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function triggerDownload(file) {
         const customCookie = inputCookie.value.trim() || savedCookie;
-        // Use relative URL — goes directly to the Render server the app is loaded from
-        const downloadUrl = `/api/download?url=${encodeURIComponent(file.dlink)}&cookie=${encodeURIComponent(customCookie)}&filename=${encodeURIComponent(file.filename)}`;
+        // MUST use absolute URL — relative /api/ paths in Capacitor resolve to capacitor://localhost
+        const base = backendBaseUrl.replace(/\/$/, '');
+        const downloadUrl = `${base}/api/download?url=${encodeURIComponent(file.dlink)}&cookie=${encodeURIComponent(customCookie)}&filename=${encodeURIComponent(file.filename)}`;
 
         // Show progress overlay
         dlOverlay.style.display = 'flex';
@@ -883,7 +884,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const timeoutId = setTimeout(() => dlAbortController.abort(), 15000);
 
         try {
-            const response = await fetch(downloadUrl, { signal: dlAbortController.signal });
+            const response = await originalFetch(downloadUrl, { signal: dlAbortController.signal });
             clearTimeout(timeoutId);
             if (!response.ok) throw new Error(`Server error ${response.status}`);
 
