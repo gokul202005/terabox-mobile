@@ -1,58 +1,6 @@
 document.addEventListener("DOMContentLoaded", () => {
     // Initialize Lucide Icons
     lucide.createIcons();
-
-    // ================= OFFLINE VIDEO CACHE (INDEXEDDB) =================
-    const VideoCache = {
-        dbName: 'TeraBoxOfflineCache',
-        storeName: 'cached_videos',
-        async open() {
-            return new Promise((resolve, reject) => {
-                const req = indexedDB.open(this.dbName, 1);
-                req.onupgradeneeded = () => {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains(this.storeName)) {
-                        db.createObjectStore(this.storeName);
-                    }
-                };
-                req.onsuccess = () => resolve(req.result);
-                req.onerror = () => reject(req.error);
-            });
-        },
-        async get(key) {
-            try {
-                const db = await this.open();
-                return new Promise((resolve) => {
-                    const tx = db.transaction(this.storeName, 'readonly');
-                    const req = tx.objectStore(this.storeName).get(key);
-                    req.onsuccess = () => resolve(req.result || null);
-                    req.onerror = () => resolve(null);
-                });
-            } catch (e) {
-                return null;
-            }
-        },
-        async put(key, blob) {
-            try {
-                const db = await this.open();
-                return new Promise((resolve) => {
-                    const tx = db.transaction(this.storeName, 'readwrite');
-                    const req = tx.objectStore(this.storeName).put(blob, key);
-                    req.onsuccess = () => resolve(true);
-                    req.onerror = () => resolve(false);
-                });
-            } catch (e) {
-                return false;
-            }
-        },
-        async delete(key) {
-            try {
-                const db = await this.open();
-                const tx = db.transaction(this.storeName, 'readwrite');
-                tx.objectStore(this.storeName).delete(key);
-            } catch (e) {}
-        }
-    };
     let currentPlayingFile = null;
 
 
@@ -893,18 +841,11 @@ document.addEventListener("DOMContentLoaded", () => {
             pendingResumeTime = 0;
         }
 
-        // Check if video is already cached on device
-        const cachedBlob = await VideoCache.get(file.filename);
-        if (cachedBlob) {
-            videoPlayer.src = URL.createObjectURL(cachedBlob);
-            showToast("⚡ Playing from offline device cache (0 data used)!", 2500);
-        } else {
-            // Construct the streaming proxy endpoint path
-            const customCookie = inputCookie.value.trim();
-            const base = backendBaseUrl.replace(/\/$/, '');
-            const streamUrl = `${base}/api/stream?url=${encodeURIComponent(file.dlink)}&cookie=${encodeURIComponent(customCookie)}`;
-            videoPlayer.src = streamUrl;
-        }
+        // Stream directly from Render server proxy
+        const customCookie = inputCookie.value.trim();
+        const base = backendBaseUrl.replace(/\/$/, '');
+        const streamUrl = `${base}/api/stream?url=${encodeURIComponent(file.dlink)}&cookie=${encodeURIComponent(customCookie)}`;
+        videoPlayer.src = streamUrl;
         
         // Open modal
         playerModal.classList.remove("hidden");
@@ -1006,28 +947,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function triggerDownload(file) {
-        // 1. Instant check if video is already cached on device
-        const cachedBlob = await VideoCache.get(file.filename);
-        if (cachedBlob) {
-            showToast("⚡ Video already in device cache! Preparing save...", 2000);
-            const shareFile = new File([cachedBlob], file.filename, { type: 'video/mp4' });
-            if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
-                try {
-                    await navigator.share({ files: [shareFile], title: file.filename });
-                    showToast("✅ Choose 'Save to device' or your gallery app!");
-                    return;
-                } catch(e) {
-                    if (e.name === 'AbortError') return;
-                }
-            }
-            const url = URL.createObjectURL(cachedBlob);
-            const a = document.createElement('a');
-            a.href = url; a.download = file.filename; a.click();
-            setTimeout(() => URL.revokeObjectURL(url), 5000);
-            showToast("✅ Saved to device from cache!");
-            return;
-        }
-
         const customCookie = inputCookie.value.trim() || savedCookie;
         // MUST use absolute URL — relative /api/ paths in Capacitor resolve to capacitor://localhost
         const base = backendBaseUrl.replace(/\/$/, '');
@@ -1072,10 +991,6 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             const blob = new Blob(chunks, { type: 'video/mp4' });
-            
-            // Save into IndexedDB cache for instant replay & re-download
-            VideoCache.put(file.filename, blob);
-
             const shareFile = new File([blob], file.filename, { type: 'video/mp4' });
             dlOverlay.style.display = 'none';
 
@@ -1087,7 +1002,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 const a = document.createElement('a');
                 a.href = url; a.download = file.filename; a.click();
                 setTimeout(() => URL.revokeObjectURL(url), 5000);
-                showToast('✅ Download complete! Saved to cache.');
+                showToast('✅ Download complete!');
             }
         } catch (e) {
             clearTimeout(timeoutId);
@@ -1106,7 +1021,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const customCookie = inputCookie.value.trim();
         showToast("Starting server download... 🚀");
         try {
-            const res = await fetch("/api/server-download", {
+            const base = backendBaseUrl.replace(/\/$/, "");
+            const res = await originalFetch(`${base}/api/server-download`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
