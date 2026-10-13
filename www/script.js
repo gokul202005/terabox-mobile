@@ -137,6 +137,12 @@ document.addEventListener("DOMContentLoaded", () => {
     let savedCookie = localStorage.getItem("ndus_cookie") || "";
     let savedFavorites = [];
     let watchHistory = {};
+    try {
+        const localHist = localStorage.getItem("terabox_watch_history");
+        if (localHist) watchHistory = JSON.parse(localHist);
+    } catch (e) {
+        watchHistory = {};
+    }
     let currentPlaylist = [];
     let currentVideoIndex = -1;
     let isDrivePlaylist = false;
@@ -189,7 +195,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 fetch(`/api/downloads-history?cookie=${encodeURIComponent(cookie)}`).then(r => r.json())
             ]);
             if (favRes.status === "success") savedFavorites = favRes.favorites || [];
-            if (histRes.status === "success") watchHistory = histRes.history || {};
+            if (histRes.status === "success") {
+                watchHistory = Object.assign({}, watchHistory, histRes.history || {});
+                try { localStorage.setItem("terabox_watch_history", JSON.stringify(watchHistory)); } catch(e) {}
+            }
             if (dlRes.status === "success") {
                 cachedServerDownloads = dlRes.downloads || [];
                 if (dlRes.megaFiles) cachedMegaFiles = dlRes.megaFiles;
@@ -230,42 +239,86 @@ document.addEventListener("DOMContentLoaded", () => {
     // Removed Plyr. Using native HTML5 video player instead.
     // Client-side hover preview removed since we use native video controls now.
 
+    // ================= VIDEO PLAYBACK POSITION & CACHING =================
     let lastHistorySave = 0;
+    let pendingResumeTime = 0;
+
+    function saveCurrentPosition() {
+        if (!videoPlayer || !modalVideoTitle.textContent) return;
+        const title = modalVideoTitle.textContent;
+        const time = videoPlayer.currentTime;
+        const duration = videoPlayer.duration;
+        if (time > 1 && (!duration || isNaN(duration) || time < duration - 5)) {
+            const fileObj = (currentPlaylist && currentPlaylist[currentVideoIndex]) ? currentPlaylist[currentVideoIndex] : { filename: title };
+            watchHistory[title] = {
+                time: Math.floor(time),
+                file: fileObj,
+                lastWatched: Date.now()
+            };
+            try {
+                localStorage.setItem("terabox_watch_history", JSON.stringify(watchHistory));
+            } catch (e) {}
+        }
+    }
+
     videoPlayer.addEventListener("timeupdate", () => {
         if (videoPlayer.paused || !modalVideoTitle.textContent) return;
         const time = videoPlayer.currentTime;
         const duration = videoPlayer.duration;
         const title = modalVideoTitle.textContent;
-        if (time > 0 && time < duration - 5) {
-            if (!watchHistory[title]) {
-                const fileObj = currentPlaylist[currentVideoIndex];
-                watchHistory[title] = { time, file: fileObj, lastWatched: Date.now() };
-            } else {
-                watchHistory[title].time = time;
-                watchHistory[title].lastWatched = Date.now();
-            }
+        
+        if (time > 1 && (!duration || isNaN(duration) || time < duration - 5)) {
+            const fileObj = (currentPlaylist && currentPlaylist[currentVideoIndex]) ? currentPlaylist[currentVideoIndex] : { filename: title };
+            watchHistory[title] = {
+                time: Math.floor(time),
+                file: fileObj,
+                lastWatched: Date.now()
+            };
             
             const now = Date.now();
-            if (now - lastHistorySave > 5000) {
+            if (now - lastHistorySave > 2000) {
                 lastHistorySave = now;
+                try {
+                    localStorage.setItem("terabox_watch_history", JSON.stringify(watchHistory));
+                } catch (e) {}
+
                 const cookieToSend = inputCookie.value.trim() || savedCookie;
-                if (!cookieToSend) return;
-                fetch("/api/history", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ cookie: cookieToSend, filename: title, time, fileData: watchHistory[title].file })
-                }).catch(e => {});
+                if (cookieToSend) {
+                    fetch("/api/history", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ cookie: cookieToSend, filename: title, time: Math.floor(time), fileData: watchHistory[title].file })
+                    }).catch(e => {});
+                }
             }
         }
     });
 
-    videoPlayer.addEventListener("loadedmetadata", () => {
-        const title = modalVideoTitle.textContent;
-        if (watchHistory[title] && watchHistory[title].time > 0) {
-            videoPlayer.currentTime = watchHistory[title].time;
-            const timestamp = new Date(watchHistory[title].time * 1000).toISOString().substr(11, 8);
-            showToast(`Resumed from ${timestamp}`, 2000);
+    videoPlayer.addEventListener("pause", () => {
+        saveCurrentPosition();
+    });
+
+    function tryResumePlayback() {
+        if (pendingResumeTime > 0) {
+            const seekTarget = pendingResumeTime;
+            pendingResumeTime = 0; // ensure it only seeks once
+            try {
+                videoPlayer.currentTime = seekTarget;
+                const h = Math.floor(seekTarget / 3600);
+                const m = Math.floor((seekTarget % 3600) / 60);
+                const s = Math.floor(seekTarget % 60);
+                const timeStr = (h > 0 ? `${h}:${String(m).padStart(2, '0')}:` : `${m}:`) + String(s).padStart(2, '0');
+                showToast(`▶️ Resumed from ${timeStr}`, 2500);
+            } catch (err) {
+                console.warn("Could not seek yet:", err);
+            }
         }
+    }
+
+    videoPlayer.addEventListener("loadedmetadata", tryResumePlayback);
+    videoPlayer.addEventListener("canplay", tryResumePlayback);
+    window.addEventListener("beforeunload", () => {
+        saveCurrentPosition();
     });
 
     // ================= TOAST NOTIFICATION =================
@@ -390,6 +443,7 @@ document.addEventListener("DOMContentLoaded", () => {
     btnHistoryClear.addEventListener("click", () => {
         if (!confirm("Are you sure you want to clear all watch history?")) return;
         watchHistory = {};
+        try { localStorage.removeItem("terabox_watch_history"); } catch(e) {}
         renderHistory();
         const cookieToSend = inputCookie.value.trim() || savedCookie;
         fetch("/api/history/clear", {
@@ -776,6 +830,14 @@ document.addEventListener("DOMContentLoaded", () => {
     function triggerVideoPlay(file) {
         modalVideoTitle.textContent = file.filename;
         
+        // Check for saved resume position
+        const saved = watchHistory[file.filename];
+        if (saved && saved.time && saved.time > 3) {
+            pendingResumeTime = saved.time;
+        } else {
+            pendingResumeTime = 0;
+        }
+
         // Construct the streaming proxy endpoint path
         const customCookie = inputCookie.value.trim();
         const base = backendBaseUrl.replace(/\/$/, '');
@@ -795,6 +857,13 @@ document.addEventListener("DOMContentLoaded", () => {
     function playLocalVideo(file) {
         modalVideoTitle.textContent = file.filename;
         
+        const saved = watchHistory[file.filename];
+        if (saved && saved.time && saved.time > 3) {
+            pendingResumeTime = saved.time;
+        } else {
+            pendingResumeTime = 0;
+        }
+
         // Set native video source
         videoPlayer.src = file.urlPath;
         
@@ -810,8 +879,10 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function closeModal() {
+        saveCurrentPosition();
         videoPlayer.pause();
-        videoPlayer.src = "";
+        videoPlayer.removeAttribute("src");
+        videoPlayer.load();
         playerModal.classList.add("hidden");
         document.body.style.overflow = ""; // restore scroll
     }

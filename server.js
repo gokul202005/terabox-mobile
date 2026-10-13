@@ -692,8 +692,7 @@ app.get("/api/stream", async (req, res) => {
         "content-length",
         "content-range",
         "accept-ranges",
-        "content-disposition",
-        "cache-control"
+        "content-disposition"
       ];
   
       headersToCopy.forEach((h) => {
@@ -702,6 +701,14 @@ app.get("/api/stream", async (req, res) => {
           res.setHeader(h, val);
         }
       });
+
+      // Enable aggressive media caching for Range requests so Android WebView
+      // and browser disk cache reuse loaded video chunks instead of re-downloading
+      res.setHeader("Cache-Control", "public, max-age=604800, stale-while-revalidate=86400");
+      res.setHeader("Accept-Ranges", "bytes");
+      const etagSeed = targetUrl.split('?')[0];
+      const etagHash = Buffer.from(etagSeed).toString('base64').substring(0, 24);
+      res.setHeader("ETag", `"${etagHash}"`);
     });
 
     stream.on("error", (e) => {
