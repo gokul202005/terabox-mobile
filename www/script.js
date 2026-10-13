@@ -2,6 +2,60 @@ document.addEventListener("DOMContentLoaded", () => {
     // Initialize Lucide Icons
     lucide.createIcons();
 
+    // ================= OFFLINE VIDEO CACHE (INDEXEDDB) =================
+    const VideoCache = {
+        dbName: 'TeraBoxOfflineCache',
+        storeName: 'cached_videos',
+        async open() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(this.dbName, 1);
+                req.onupgradeneeded = () => {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(this.storeName)) {
+                        db.createObjectStore(this.storeName);
+                    }
+                };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        },
+        async get(key) {
+            try {
+                const db = await this.open();
+                return new Promise((resolve) => {
+                    const tx = db.transaction(this.storeName, 'readonly');
+                    const req = tx.objectStore(this.storeName).get(key);
+                    req.onsuccess = () => resolve(req.result || null);
+                    req.onerror = () => resolve(null);
+                });
+            } catch (e) {
+                return null;
+            }
+        },
+        async put(key, blob) {
+            try {
+                const db = await this.open();
+                return new Promise((resolve) => {
+                    const tx = db.transaction(this.storeName, 'readwrite');
+                    const req = tx.objectStore(this.storeName).put(blob, key);
+                    req.onsuccess = () => resolve(true);
+                    req.onerror = () => resolve(false);
+                });
+            } catch (e) {
+                return false;
+            }
+        },
+        async delete(key) {
+            try {
+                const db = await this.open();
+                const tx = db.transaction(this.storeName, 'readwrite');
+                tx.objectStore(this.storeName).delete(key);
+            } catch (e) {}
+        }
+    };
+    let currentPlayingFile = null;
+
+
     // ================= DUAL-MODE BACKEND LOGIC =================
     let backendBaseUrl = localStorage.getItem("backendBaseUrl") || "https://terabox-mobile.onrender.com";
     let serverMode = localStorage.getItem("serverMode") || "cloud";
@@ -827,7 +881,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    function triggerVideoPlay(file) {
+    async function triggerVideoPlay(file) {
+        currentPlayingFile = file;
         modalVideoTitle.textContent = file.filename;
         
         // Check for saved resume position
@@ -838,13 +893,18 @@ document.addEventListener("DOMContentLoaded", () => {
             pendingResumeTime = 0;
         }
 
-        // Construct the streaming proxy endpoint path
-        const customCookie = inputCookie.value.trim();
-        const base = backendBaseUrl.replace(/\/$/, '');
-        const streamUrl = `${base}/api/stream?url=${encodeURIComponent(file.dlink)}&cookie=${encodeURIComponent(customCookie)}`;
-        
-        // Set native video source
-        videoPlayer.src = streamUrl;
+        // Check if video is already cached on device
+        const cachedBlob = await VideoCache.get(file.filename);
+        if (cachedBlob) {
+            videoPlayer.src = URL.createObjectURL(cachedBlob);
+            showToast("⚡ Playing from offline device cache (0 data used)!", 2500);
+        } else {
+            // Construct the streaming proxy endpoint path
+            const customCookie = inputCookie.value.trim();
+            const base = backendBaseUrl.replace(/\/$/, '');
+            const streamUrl = `${base}/api/stream?url=${encodeURIComponent(file.dlink)}&cookie=${encodeURIComponent(customCookie)}`;
+            videoPlayer.src = streamUrl;
+        }
         
         // Open modal
         playerModal.classList.remove("hidden");
@@ -887,6 +947,14 @@ document.addEventListener("DOMContentLoaded", () => {
         document.body.style.overflow = ""; // restore scroll
     }
 
+    const btnModalDownload = document.getElementById("btn-modal-download");
+    if (btnModalDownload) {
+        btnModalDownload.addEventListener("click", () => {
+            if (currentPlayingFile) {
+                triggerDownload(currentPlayingFile);
+            }
+        });
+    }
     btnCloseModal.addEventListener("click", closeModal);
     modalBackdrop.addEventListener("click", closeModal);
 
@@ -938,6 +1006,28 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function triggerDownload(file) {
+        // 1. Instant check if video is already cached on device
+        const cachedBlob = await VideoCache.get(file.filename);
+        if (cachedBlob) {
+            showToast("⚡ Video already in device cache! Preparing save...", 2000);
+            const shareFile = new File([cachedBlob], file.filename, { type: 'video/mp4' });
+            if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
+                try {
+                    await navigator.share({ files: [shareFile], title: file.filename });
+                    showToast("✅ Choose 'Save to device' or your gallery app!");
+                    return;
+                } catch(e) {
+                    if (e.name === 'AbortError') return;
+                }
+            }
+            const url = URL.createObjectURL(cachedBlob);
+            const a = document.createElement('a');
+            a.href = url; a.download = file.filename; a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+            showToast("✅ Saved to device from cache!");
+            return;
+        }
+
         const customCookie = inputCookie.value.trim() || savedCookie;
         // MUST use absolute URL — relative /api/ paths in Capacitor resolve to capacitor://localhost
         const base = backendBaseUrl.replace(/\/$/, '');
@@ -951,8 +1041,8 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById('dl-size').textContent = 'Connecting...';
 
         dlAbortController = new AbortController();
-        // 15 second connection timeout
-        const timeoutId = setTimeout(() => dlAbortController.abort(), 15000);
+        // 20 second connection timeout
+        const timeoutId = setTimeout(() => dlAbortController.abort(), 20000);
 
         try {
             const response = await originalFetch(downloadUrl, { signal: dlAbortController.signal });
@@ -982,6 +1072,10 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             const blob = new Blob(chunks, { type: 'video/mp4' });
+            
+            // Save into IndexedDB cache for instant replay & re-download
+            VideoCache.put(file.filename, blob);
+
             const shareFile = new File([blob], file.filename, { type: 'video/mp4' });
             dlOverlay.style.display = 'none';
 
@@ -993,14 +1087,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 const a = document.createElement('a');
                 a.href = url; a.download = file.filename; a.click();
                 setTimeout(() => URL.revokeObjectURL(url), 5000);
-                showToast('✅ Download complete!');
+                showToast('✅ Download complete! Saved to cache.');
             }
         } catch (e) {
             clearTimeout(timeoutId);
             dlOverlay.style.display = 'none';
             if (e.name === 'AbortError') {
                 showToast('❌ Connection timed out. The video link may have expired. Try streaming it first.');
-            } else if (e.message.includes('Share canceled')) {
+            } else if (e.message && e.message.includes('Share canceled')) {
                 // user dismissed share sheet, not an error
             } else {
                 showToast('❌ Download failed: ' + e.message);
